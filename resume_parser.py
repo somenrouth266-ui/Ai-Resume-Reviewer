@@ -2,7 +2,9 @@
 resume_parser.py — Resume File Parsing Module
 ===============================================
 Extracts plain text from PDF and DOCX resume files.
-Images, graphics, and non-text elements are silently ignored.
+Uses pdfplumber for text-based PDFs.
+Falls back to PyMuPDF (fitz) for complex/designed PDFs.
+Images and graphics are silently ignored in all cases.
 """
 
 import io
@@ -13,55 +15,117 @@ from docx.oxml.ns import qn
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     """
-    Extract all text from a PDF file provided as raw bytes.
-    Images and graphics are automatically skipped by pdfplumber.
-    Only text characters are extracted — photos have no effect.
+    Extract all text from a PDF using multiple strategies.
+
+    Strategy 1: pdfplumber  — works for most standard PDFs
+    Strategy 2: PyMuPDF     — works for designed/complex PDFs with
+                               text boxes, columns, and embedded fonts
+    Strategy 3: Raw string  — last resort character-level extraction
+
+    Images and photos are silently ignored in all strategies.
 
     Args:
         file_bytes: Raw bytes of the uploaded PDF file.
 
     Returns:
-        A single string containing all extracted text.
+        Extracted text string.
 
     Raises:
-        ValueError: If the bytes cannot be parsed as a valid PDF.
+        ValueError: If all strategies fail to extract any text.
     """
+
+    # ── Strategy 1: pdfplumber ────────────────────────────────────────────────
     try:
         text_parts = []
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
                 try:
-                    # crop() with a bounding box covering the full page
-                    # helps isolate text even in complex multi-column layouts
-                    page_text = page.extract_text(
-                        x_tolerance=3,
-                        y_tolerance=3,
-                    )
+                    page_text = page.extract_text(x_tolerance=3, y_tolerance=3)
                     if page_text and page_text.strip():
                         text_parts.append(page_text.strip())
                 except Exception:
-                    # If a single page fails (e.g. image-only page), skip it
                     continue
+        result = "\n\n".join(text_parts).strip()
+        if result and len(result) > 50:
+            return result
+    except Exception:
+        pass
 
-        full_text = "\n\n".join(text_parts)
+    # ── Strategy 2: PyMuPDF (fitz) ───────────────────────────────────────────
+    # Handles designed resumes, multi-column layouts, text boxes, custom fonts
+    try:
+        import fitz  # PyMuPDF
+        text_parts = []
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        for page in doc:
+            try:
+                # get_text("text") extracts plain text, ignoring images
+                page_text = page.get_text("text")
+                if page_text and page_text.strip():
+                    text_parts.append(page_text.strip())
+            except Exception:
+                continue
+        doc.close()
+        result = "\n\n".join(text_parts).strip()
+        if result and len(result) > 50:
+            return result
+    except ImportError:
+        pass  # PyMuPDF not installed, continue to next strategy
+    except Exception:
+        pass
 
-        # If nothing was extracted at all, try a fallback with looser settings
-        if not full_text.strip():
-            text_parts = []
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                for page in pdf.pages:
-                    try:
-                        page_text = page.extract_text()
-                        if page_text and page_text.strip():
-                            text_parts.append(page_text.strip())
-                    except Exception:
-                        continue
-            full_text = "\n\n".join(text_parts)
+    # ── Strategy 3: PyMuPDF HTML extraction ──────────────────────────────────
+    # Some PDFs store text in HTML-like blocks — extract and strip tags
+    try:
+        import fitz
+        import re
+        text_parts = []
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        for page in doc:
+            try:
+                html = page.get_text("html")
+                # Strip HTML tags to get plain text
+                clean = re.sub(r"<[^>]+>", " ", html)
+                clean = re.sub(r"\s+", " ", clean).strip()
+                if clean and len(clean) > 20:
+                    text_parts.append(clean)
+            except Exception:
+                continue
+        doc.close()
+        result = "\n\n".join(text_parts).strip()
+        if result and len(result) > 50:
+            return result
+    except Exception:
+        pass
 
-        return full_text
+    # ── Strategy 4: pdfplumber loose settings ────────────────────────────────
+    try:
+        text_parts = []
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                try:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_parts.append(page_text)
+                except Exception:
+                    continue
+        result = "\n\n".join(text_parts).strip()
+        if result and len(result) > 50:
+            return result
+    except Exception:
+        pass
 
-    except Exception as exc:
-        raise ValueError(f"Failed to parse PDF: {exc}") from exc
+    # ── All strategies failed ─────────────────────────────────────────────────
+    raise ValueError(
+        "Could not extract text from this PDF.\n\n"
+        "This usually happens when:\n"
+        "• The resume was saved as an image inside a PDF\n"
+        "• The PDF uses heavily encrypted or non-standard fonts\n\n"
+        "Please try:\n"
+        "1. Open your resume in Word or Google Docs\n"
+        "2. Export/Download as PDF again\n"
+        "3. Upload the new PDF"
+    )
 
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
@@ -86,15 +150,13 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
         # ── Main body paragraphs ──────────────────────────────────────────────
         for para in doc.paragraphs:
             try:
-                # Skip paragraph if it only contains an image (drawing element)
-                # by checking if it has any actual text runs
                 text = para.text.strip()
                 if text:
                     parts.append(text)
             except Exception:
                 continue
 
-        # ── Tables (many resume templates use table-based layouts) ────────────
+        # ── Tables ────────────────────────────────────────────────────────────
         for table in doc.tables:
             for row in table.rows:
                 row_texts = []
@@ -125,7 +187,7 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
             except Exception:
                 pass
 
-        # ── Text boxes (some designer templates put content in text boxes) ────
+        # ── Text boxes ────────────────────────────────────────────────────────
         try:
             body = doc.element.body
             for txbx in body.iter(qn("w:txbxContent")):
@@ -141,7 +203,12 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
         except Exception:
             pass
 
-        return "\n".join(parts)
+        result = "\n".join(parts).strip()
+        if not result:
+            raise ValueError("No text could be extracted from this DOCX file.")
+        return result
 
+    except ValueError:
+        raise
     except Exception as exc:
         raise ValueError(f"Failed to parse DOCX: {exc}") from exc
